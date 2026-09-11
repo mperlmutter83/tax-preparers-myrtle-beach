@@ -39,6 +39,22 @@ export default function RootLayout({
   return (
     <html lang="en">
       <head>
+        {/* RFM site data - pushed before GTM loads */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `window.dataLayer = window.dataLayer || [];
+window.dataLayer.push({
+  rfm: {
+    schema_version: "1.0",
+    site_id: "tax_preparers_myrtle_beach",
+    provider_id: "95a173a1-a8a1-4934-a386-58784ebd56ec",
+    provider_name: "Tax Preparers Myrtle Beach",
+    service_category: "tax_preparation",
+    market: "myrtle_beach"
+  }
+});`,
+          }}
+        />
         <script
           type="application/ld+json"
           dangerouslySetInnerHTML={{
