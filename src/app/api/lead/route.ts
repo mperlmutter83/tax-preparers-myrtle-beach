@@ -1,20 +1,137 @@
 import { NextRequest, NextResponse } from 'next/server';
 
+// "Looking for Work" applicants are emailed directly to Mike in addition to
+// landing in the CRM. Uses the shared Resend account (verified sender: yesidoinc.com).
+const NOTIFY_TO = 'yescrewnetwork@gmail.com';
+const FROM = 'Tax Preparers Myrtle Beach <info@yesidoinc.com>';
+const DOMAIN = 'taxpreparersmyrtlebeach.com';
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+async function notifyWorkApplicant(opts: {
+  name: string;
+  phone: string;
+  email: string | null;
+  serviceNeeded: string | null;
+}): Promise<{ ok: boolean; error?: string }> {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) return { ok: false, error: 'RESEND_API_KEY not set' };
+
+  const html = `
+    <div style="font-family:system-ui,-apple-system,sans-serif;font-size:15px;color:#111;">
+      <h2 style="margin:0 0 12px;">New work applicant — ${DOMAIN}</h2>
+      <p><strong>Name:</strong> ${escapeHtml(opts.name)}</p>
+      <p><strong>Phone:</strong> ${escapeHtml(opts.phone)}</p>
+      ${opts.email ? `<p><strong>Email:</strong> ${escapeHtml(opts.email)}</p>` : ''}
+      ${opts.serviceNeeded ? `<p><strong>Details:</strong> ${escapeHtml(opts.serviceNeeded)}</p>` : ''}
+      <hr style="border:none;border-top:1px solid #eee;margin:20px 0;" />
+      <p style="font-size:13px;color:#888;">Reply directly to this email to respond to the applicant.</p>
+    </div>
+  `;
+
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: FROM,
+        to: NOTIFY_TO,
+        replyTo: opts.email || undefined,
+        subject: `New work applicant — ${opts.name} (${DOMAIN})`,
+        html,
+      }),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error('Resend send failed:', res.status, errText);
+      return { ok: false, error: `Resend ${res.status}: ${errText}` };
+    }
+    return { ok: true };
+  } catch (err) {
+    console.error('Resend send error:', err);
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { name, email, phone, service, message } = body;
+    const { name, email, phone, service, message, submission_id, elapsed_ms, company_website } = body;
 
-    // Log the lead (in production, send to CRM/webhook)
-    console.log('New lead received:', { name, email, phone, service, message });
+    if (!phone) {
+      return NextResponse.json({ error: 'Phone is required' }, { status: 400 });
+    }
 
-    // Here you would typically:
-    // 1. Send to your CRM
-    // 2. Send notification email
-    // 3. Store in database
+    const isWorkApplicant = service === 'Looking for Work';
 
-    return NextResponse.json({ success: true });
-  } catch {
+    const serviceNeeded = [
+      `Service: ${service || 'Tax Preparation'}`,
+      message ? `Details: ${message}` : null,
+      `Source: ${DOMAIN}`,
+    ]
+      .filter(Boolean)
+      .join(' | ');
+
+    const crmFormKey = process.env.CRM_FORM_KEY;
+    let crmResponse: Response | null = null;
+    if (crmFormKey) {
+      crmResponse = await fetch(
+        `https://yescrew-dashboard.vercel.app/api/forms/${crmFormKey}/submit`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name,
+            email: email || null,
+            phone,
+            service_needed: serviceNeeded,
+            submission_id,
+            elapsed_ms,
+            company_website,
+          }),
+        }
+      );
+    } else {
+      console.error('CRM_FORM_KEY is not configured');
+    }
+
+    // Work applicants always get emailed to Mike — even if the CRM hiccups,
+    // no job seeker is lost.
+    let emailResult: { ok: boolean; error?: string } | null = null;
+    if (isWorkApplicant) {
+      emailResult = await notifyWorkApplicant({
+        name,
+        phone,
+        email: email || null,
+        serviceNeeded,
+      });
+    }
+    const emailed = emailResult?.ok ?? false;
+
+    if (crmResponse && !crmResponse.ok) {
+      console.error('CRM form submit failed:', crmResponse.status);
+      if (isWorkApplicant && emailed) {
+        return NextResponse.json({ success: true, workApplicantEmailed: true }, { status: 201 });
+      }
+      return NextResponse.json({ error: 'Failed to submit lead' }, { status: 502 });
+    }
+
+    return NextResponse.json({
+      success: true,
+      workApplicantEmailed: isWorkApplicant ? emailed : undefined,
+      workApplicantEmailError: emailResult?.error,
+    });
+  } catch (error) {
+    console.error('Lead submission error:', error);
     return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
   }
 }
